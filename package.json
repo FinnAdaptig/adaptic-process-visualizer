@@ -1,0 +1,21 @@
+{
+  "name": "bpmn-miro-clone",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MVP web app to create and edit BPMN-style swimlane diagrams via AI.",
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "concurrently -c green,blue -n backend,frontend \"npm:dev --workspace backend\" \"npm:dev --workspace frontend\"",
+    "build": "npm run build --workspace backend && npm run build --workspace frontend",
+    "start": "npm run start --workspace backend",
+    "typecheck": "npm run typecheck --workspace backend && npm run typecheck --workspace frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
+
+

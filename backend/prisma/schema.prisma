@@ -1,0 +1,32 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Department {
+  id         Int        @id @default(autoincrement())
+  name       String     @unique
+  workflows  Workflow[]
+  createdAt  DateTime   @default(now()) @map("created_at")
+
+  @@map("departments")
+}
+
+model Workflow {
+  id           Int        @id @default(autoincrement())
+  name         String
+  departmentId Int        @map("department_id")
+  department   Department @relation(fields: [departmentId], references: [id])
+  jsonContent  Json       @map("json_content")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  @@index([departmentId])
+  @@map("workflows")
+}
+
+

@@ -1,0 +1,64 @@
+{
+  "id": "workflow_1755691765050",
+  "name": "New Workfloww",
+  "departmentId": 1,
+  "json": {
+    "processName": "Untitled Process",
+    "swimlanes": [
+      {
+        "id": "lane-1",
+        "label": "Lane A",
+        "elements": [
+          "start-1",
+          "task-1"
+        ]
+      },
+      {
+        "id": "lane-2",
+        "label": "Lane B",
+        "elements": [
+          "end-1"
+        ]
+      }
+    ],
+    "elements": [
+      {
+        "id": "start-1",
+        "type": "start_event",
+        "label": "Start",
+        "position": {
+          "x": 80,
+          "y": 80
+        }
+      },
+      {
+        "id": "task-1",
+        "type": "task",
+        "label": "Task",
+        "position": {
+          "x": 240,
+          "y": 70
+        }
+      },
+      {
+        "id": "end-1",
+        "type": "end_event",
+        "label": "End",
+        "position": {
+          "x": 420,
+          "y": 80
+        }
+      }
+    ],
+    "connections": [
+      {
+        "source": "start-1",
+        "target": "task-1"
+      },
+      {
+        "source": "task-1",
+        "target": "end-1"
+      }
+    ]
+  }
+}
