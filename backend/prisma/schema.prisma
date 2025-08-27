@@ -3,30 +3,75 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
+}
+
+model User {
+  id           Int                @id @default(autoincrement())
+  email        String             @unique
+  name         String
+  createdAt    DateTime           @default(now()) @map("created_at")
+  updatedAt    DateTime           @updatedAt @map("updated_at")
+  
+  // Relations
+  workflows        Workflow[]
+  workflowVersions WorkflowVersion[]
+
+  @@map("users")
 }
 
 model Department {
   id         Int        @id @default(autoincrement())
   name       String     @unique
-  workflows  Workflow[]
   createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+  
+  // Relations
+  workflows  Workflow[]
 
   @@map("departments")
 }
 
 model Workflow {
-  id           Int        @id @default(autoincrement())
+  id           String            @id @default(cuid())
   name         String
-  departmentId Int        @map("department_id")
-  department   Department @relation(fields: [departmentId], references: [id])
-  jsonContent  Json       @map("json_content")
-  createdAt    DateTime   @default(now()) @map("created_at")
-  updatedAt    DateTime   @updatedAt @map("updated_at")
+  description  String?
+  departmentId Int               @map("department_id")
+  createdById  Int?              @map("created_by_id")
+  isDeleted    Boolean           @default(false) @map("is_deleted")
+  displayOrder Int               @default(0) @map("display_order")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  
+  // Relations
+  department   Department        @relation(fields: [departmentId], references: [id])
+  createdBy    User?             @relation(fields: [createdById], references: [id])
+  versions     WorkflowVersion[]
 
   @@index([departmentId])
+  @@index([createdById])
+  @@index([displayOrder])
   @@map("workflows")
+}
+
+model WorkflowVersion {
+  id          String   @id @default(cuid())
+  workflowId  String   @map("workflow_id")
+  versionNumber Int    @map("version_number")
+  jsonContent String   @map("json_content")
+  changeNote  String?  @map("change_note")
+  createdById Int?     @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  
+  // Relations
+  workflow    Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+
+  @@unique([workflowId, versionNumber])
+  @@index([workflowId])
+  @@index([createdById])
+  @@map("workflow_versions")
 }
 
 

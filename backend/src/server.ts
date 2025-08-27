@@ -3,11 +3,7 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import { z } from 'zod'
 import axios from 'axios'
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WORKFLOW_DIR = path.join(__dirname, '../data/workflows');
+import { prisma, createWorkflowVersion, getWorkflowWithLatestVersion, getWorkflowVersionHistory } from './db.js'
 
 dotenv.config()
 
@@ -285,36 +281,104 @@ app.post('/api/workflows', async (req, res) => {
   try {
     const { name, departmentId, json } = CreateWorkflowSchema.parse({
       name: req.body?.name,
-      departmentId: req.body?.departmentId,
+      departmentId: req.body?.departmentId || 1, // Default to department 1 if not provided
       json: req.body?.json
     });
-    const id = `workflow_${Date.now()}`;
-    const wf = { id, name, departmentId, json };
-    fs.writeFileSync(path.join(WORKFLOW_DIR, `${id}.json`), JSON.stringify(wf, null, 2));
-    res.status(201).json(wf);
+    
+    // Create the workflow
+    const workflow = await prisma.workflow.create({
+      data: {
+        name,
+        departmentId,
+        displayOrder: await getNextDisplayOrder(departmentId)
+      }
+    });
+    
+    // Create the initial version
+    await createWorkflowVersion(workflow.id, json, 'Initial version');
+    
+    // Return workflow with format expected by frontend
+    const result = {
+      id: workflow.id,
+      name: workflow.name,
+      departmentId: workflow.departmentId,
+      json,
+      createdAt: workflow.createdAt,
+      updatedAt: workflow.updatedAt
+    };
+    
+    res.status(201).json(result);
   } catch (e: any) {
+    console.error('Error creating workflow:', e);
     res.status(400).json({ error: e?.message || 'Invalid payload' });
   }
 })
 
+async function getNextDisplayOrder(departmentId: number): Promise<number> {
+  const lastWorkflow = await prisma.workflow.findFirst({
+    where: { departmentId, isDeleted: false },
+    orderBy: { displayOrder: 'desc' }
+  });
+  return (lastWorkflow?.displayOrder || 0) + 1;
+}
+
 // Get workflow by id
 app.get('/api/workflows/:id', async (req, res) => {
-  const wfPath = path.join(WORKFLOW_DIR, `${req.params.id}.json`);
-  if (fs.existsSync(wfPath)) {
-    const wf = JSON.parse(fs.readFileSync(wfPath, 'utf8'));
-    // Add jsonContent for frontend compatibility
-    res.json({ ...wf, jsonContent: wf.json });
-  } else {
-    res.status(404).json({ error: 'Workflow not found' });
+  try {
+    const workflow = await getWorkflowWithLatestVersion(req.params.id);
+    if (workflow) {
+      // Format for frontend compatibility
+      const result = {
+        id: workflow.id,
+        name: workflow.name,
+        departmentId: workflow.departmentId,
+        json: workflow.jsonContent,
+        jsonContent: workflow.jsonContent, // Both for compatibility
+        createdAt: workflow.createdAt,
+        updatedAt: workflow.updatedAt,
+        currentVersion: workflow.currentVersion
+      };
+      res.json(result);
+    } else {
+      res.status(404).json({ error: 'Workflow not found' });
+    }
+  } catch (e: any) {
+    console.error('Error fetching workflow:', e);
+    res.status(500).json({ error: 'Internal server error' });
   }
 })
 
 // List workflows by department
 app.get('/api/departments/:deptId/workflows', async (req, res) => {
-  // List all workflow JSON files (ignoring department)
-  const files = fs.readdirSync(WORKFLOW_DIR).filter(f => f.endsWith('.json'));
-  const list = files.map(f => JSON.parse(fs.readFileSync(path.join(WORKFLOW_DIR, f), 'utf8')));
-  res.json(list);
+  try {
+    const departmentId = parseInt(req.params.deptId);
+    const workflows = await prisma.workflow.findMany({
+      where: { 
+        departmentId,
+        isDeleted: false 
+      },
+      include: {
+        versions: {
+          orderBy: { versionNumber: 'desc' },
+          take: 1
+        }
+      },
+      orderBy: { displayOrder: 'asc' }
+    });
+    
+    const result = workflows.map(wf => ({
+      id: wf.id,
+      name: wf.name,
+      departmentId: wf.departmentId,
+      updatedAt: wf.updatedAt.toISOString(),
+      jsonContent: wf.versions[0] ? JSON.parse(wf.versions[0].jsonContent) : null
+    }));
+    
+    res.json(result);
+  } catch (e: any) {
+    console.error('Error listing workflows:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 })
 
 // Update workflow
@@ -325,56 +389,192 @@ const UpdateWorkflowSchema = z.object({
 })
 
 app.put('/api/workflows/:id', async (req, res) => {
-  const wfPath = path.join(WORKFLOW_DIR, `${req.params.id}.json`);
   try {
     const payload = UpdateWorkflowSchema.parse({
       name: req.body?.name,
       departmentId: req.body?.departmentId,
       json: req.body?.json
     });
-    if (fs.existsSync(wfPath)) {
-      const wf = { ...JSON.parse(fs.readFileSync(wfPath, 'utf8')), ...payload };
-      fs.writeFileSync(wfPath, JSON.stringify(wf, null, 2));
-      res.json(wf);
+    
+    const workflow = await prisma.workflow.findUnique({
+      where: { id: req.params.id }
+    });
+    
+    if (!workflow) {
+      return res.status(404).json({ error: 'Workflow not found' });
+    }
+    
+    // Update workflow metadata
+    const updatedWorkflow = await prisma.workflow.update({
+      where: { id: req.params.id },
+      data: {
+        name: payload.name || workflow.name,
+        departmentId: payload.departmentId || workflow.departmentId
+      }
+    });
+    
+    // If JSON content is being updated, create a new version
+    if (payload.json) {
+      await createWorkflowVersion(workflow.id, payload.json, 'Updated via API');
+    }
+    
+    // Get the latest version for response
+    const result = await getWorkflowWithLatestVersion(workflow.id);
+    if (result) {
+      res.json({
+        id: result.id,
+        name: result.name,
+        departmentId: result.departmentId,
+        json: result.jsonContent,
+        createdAt: result.createdAt,
+        updatedAt: result.updatedAt
+      });
     } else {
-      res.status(404).json({ error: 'Workflow not found' });
+      res.status(500).json({ error: 'Error retrieving updated workflow' });
     }
   } catch (e: any) {
+    console.error('Error updating workflow:', e);
     res.status(400).json({ error: e?.message || 'Invalid payload' });
   }
 })
 
 // Delete workflow
 app.delete('/api/workflows/:id', async (req, res) => {
-  const wfPath = path.join(WORKFLOW_DIR, `${req.params.id}.json`);
-  if (fs.existsSync(wfPath)) {
-    fs.unlinkSync(wfPath);
+  try {
+    const workflow = await prisma.workflow.findUnique({
+      where: { id: req.params.id }
+    });
+    
+    if (!workflow) {
+      return res.status(404).json({ error: 'Workflow not found' });
+    }
+    
+    // Soft delete by setting isDeleted flag
+    await prisma.workflow.update({
+      where: { id: req.params.id },
+      data: { isDeleted: true }
+    });
+    
     res.json({ success: true });
-  } else {
-    res.status(404).json({ error: 'Workflow not found' });
+  } catch (e: any) {
+    console.error('Error deleting workflow:', e);
+    res.status(500).json({ error: 'Internal server error' });
   }
 })
 
 // Single library endpoint: departments with workflows (sorted by updatedAt desc)
 app.get('/api/library', async (_req, res) => {
-  // Return all workflows grouped under a default department
-  const files = fs.readdirSync(WORKFLOW_DIR).filter(f => f.endsWith('.json'));
-  const workflows = files.map(f => {
-    const wf = JSON.parse(fs.readFileSync(path.join(WORKFLOW_DIR, f), 'utf8'));
-    return {
-      id: wf.id,
-      name: wf.name,
-      updatedAt: wf.updatedAt || new Date().toISOString(),
-      jsonContent: wf.json
-    };
-  });
-  res.json([
-    {
-      departmentId: 1,
-      departmentName: 'Default',
-      workflows
+  try {
+    // Get all departments with their workflows
+    const departments = await prisma.department.findMany({
+      include: {
+        workflows: {
+          where: { isDeleted: false },
+          include: {
+            versions: {
+              orderBy: { versionNumber: 'desc' },
+              take: 1
+            }
+          },
+          orderBy: { displayOrder: 'asc' }
+        }
+      }
+    });
+    
+    const result = departments.map(dept => ({
+      departmentId: dept.id,
+      departmentName: dept.name,
+      workflows: dept.workflows.map(wf => ({
+        id: wf.id,
+        name: wf.name,
+        updatedAt: wf.updatedAt.toISOString(),
+        jsonContent: wf.versions[0] ? JSON.parse(wf.versions[0].jsonContent) : null
+      }))
+    }));
+    
+    res.json(result);
+  } catch (e: any) {
+    console.error('Error fetching library:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+})
+
+// Get workflow version history
+app.get('/api/workflows/:id/versions', async (req, res) => {
+  try {
+    const versions = await getWorkflowVersionHistory(req.params.id, 20);
+    const result = versions.map(v => ({
+      id: v.id,
+      versionNumber: v.versionNumber,
+      jsonContent: JSON.parse(v.jsonContent),
+      changeNote: v.changeNote,
+      createdAt: v.createdAt,
+      createdBy: v.createdBy
+    }));
+    res.json(result);
+  } catch (e: any) {
+    console.error('Error fetching version history:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+})
+
+// Restore workflow to specific version
+app.post('/api/workflows/:id/restore/:versionNumber', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const versionNumber = parseInt(req.params.versionNumber);
+    
+    // Get the specific version
+    const version = await prisma.workflowVersion.findUnique({
+      where: {
+        workflowId_versionNumber: {
+          workflowId: id,
+          versionNumber
+        }
+      }
+    });
+    
+    if (!version) {
+      return res.status(404).json({ error: 'Version not found' });
     }
-  ]);
+    
+    // Create a new version with the restored content
+    const newVersion = await createWorkflowVersion(
+      id, 
+      JSON.parse(version.jsonContent), 
+      `Restored from version ${versionNumber}`
+    );
+    
+    res.json({
+      success: true,
+      newVersionNumber: newVersion.versionNumber,
+      restoredFromVersion: versionNumber
+    });
+  } catch (e: any) {
+    console.error('Error restoring version:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+})
+
+// Update workflow display order (for drag & drop reordering)
+app.put('/api/workflows/:id/order', async (req, res) => {
+  try {
+    const { displayOrder } = req.body;
+    
+    if (typeof displayOrder !== 'number') {
+      return res.status(400).json({ error: 'displayOrder must be a number' });
+    }
+    
+    await prisma.workflow.update({
+      where: { id: req.params.id },
+      data: { displayOrder }
+    });
+    
+    res.json({ success: true });
+  } catch (e: any) {
+    console.error('Error updating workflow order:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 })
 
 app.post('/process/reset', (req, res) => {

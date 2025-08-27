@@ -48,7 +48,7 @@ const initialModel: ProcessModel = {
   ]
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8080'
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8082'
 
 export const App: React.FC = () => {
   const [model, setModel] = useState<ProcessModel>(initialModel)
@@ -61,19 +61,31 @@ export const App: React.FC = () => {
     const s = localStorage.getItem('sidebarOpen')
     return s ? s === '1' : false
   })
-  const [isMobile, setIsMobile] = useState<boolean>(() => window.matchMedia('(max-width: 900px)').matches)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [activeWorkflowId, setActiveWorkflowId] = useState<number | null>(null)
-  const [library, setLibrary] = useState<Array<{ departmentId: number; departmentName: string; workflows: Array<{ id: number; name: string; updatedAt: string }> }>>([])
+  const [library, setLibrary] = useState<Array<{ departmentId: number; departmentName: string; workflows: Array<{ id: string; name: string; updatedAt: string }> }>>([])
   const [saving, setSaving] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [saveError, setSaveError] = useState<string | null>(null)
+  
+  // Version history states
+  const [history, setHistory] = useState<ProcessModel[]>([initialModel])
+  const [historyIndex, setHistoryIndex] = useState(0)
+  const [historyAction, setHistoryAction] = useState<'none' | 'undo' | 'redo'>('none')
 
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width: 900px)')
-    const onChange = () => setIsMobile(mq.matches)
-    mq.addEventListener('change', onChange)
-    return () => mq.removeEventListener('change', onChange)
-  }, [])
+  // Enhanced database version history
+  const [versionHistory, setVersionHistory] = useState<Array<{
+    id: string
+    versionNumber: number
+    jsonContent: ProcessModel
+    changeNote?: string
+    createdAt: string
+    createdBy?: { id: number; name: string; email: string }
+  }>>([])
+  const [showVersionHistory, setShowVersionHistory] = useState(false)
+  
+  // Workflow management states
+  const [editingWorkflowId, setEditingWorkflowId] = useState<number | null>(null)
+  const [editingName, setEditingName] = useState('')
 
   useEffect(() => {
     function onEsc(e: KeyboardEvent) {
@@ -82,6 +94,25 @@ export const App: React.FC = () => {
     window.addEventListener('keydown', onEsc)
     return () => window.removeEventListener('keydown', onEsc)
   }, [sidebarOpen])
+  
+  // Add keyboard shortcuts for history navigation (Ctrl+Z, Ctrl+Y)
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      // Check for Ctrl+Z or Cmd+Z (Mac)
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        e.preventDefault()
+        goBackInHistory()
+      }
+      // Check for Ctrl+Y or Cmd+Shift+Z (Mac)
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
+        e.preventDefault()
+        goForwardInHistory()
+      }
+    }
+    
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [historyIndex, history.length])
 
   // Load library once
   useEffect(() => {
@@ -105,6 +136,50 @@ export const App: React.FC = () => {
     setSidebarOpen(next)
     localStorage.setItem('sidebarOpen', next ? '1' : '0')
   }
+  
+  // Version history functions
+  function updateModelWithHistory(newModel: ProcessModel) {
+    // When setting a new model, truncate any future history
+    const newHistory = history.slice(0, historyIndex + 1)
+    newHistory.push(newModel)
+    setModel(newModel)
+    setHistory(newHistory)
+    setHistoryIndex(newHistory.length - 1)
+  }
+  
+  function goBackInHistory() {
+    if (historyIndex > 0) {
+      const newIndex = historyIndex - 1
+      setHistoryIndex(newIndex)
+      setModel(history[newIndex])
+      setHistoryAction('undo')
+      
+      // Clear the history action after a delay
+      setTimeout(() => setHistoryAction('none'), 2000)
+      
+      // Save the reverted state if this is an active workflow
+      if (activeWorkflowId != null) {
+        scheduleSave(activeWorkflowId, history[newIndex]);
+      }
+    }
+  }
+  
+  function goForwardInHistory() {
+    if (historyIndex < history.length - 1) {
+      const newIndex = historyIndex + 1
+      setHistoryIndex(newIndex)
+      setModel(history[newIndex])
+      setHistoryAction('redo')
+      
+      // Clear the history action after a delay
+      setTimeout(() => setHistoryAction('none'), 2000)
+      
+      // Save the restored state if this is an active workflow
+      if (activeWorkflowId != null) {
+        scheduleSave(activeWorkflowId, history[newIndex]);
+      }
+    }
+  }
 
   async function loadWorkflow(id: number) {
     const res = await fetch(`${API_BASE}/api/workflows/${id}`)
@@ -112,8 +187,108 @@ export const App: React.FC = () => {
     const wf = await res.json()
     const parsed = ProcessSchema.parse(wf.json)
     setActiveWorkflowId(wf.id)
+    
+    // Reset history when loading a new workflow
+    setHistory([parsed])
+    setHistoryIndex(0)
     setModel(parsed)
     setSelectedKey(String(wf.id))
+    
+    // Load database version history for this workflow
+    if (typeof wf.id === 'string') {
+      await loadVersionHistory(wf.id)
+    }
+  }
+
+  // Load version history for active workflow
+  async function loadVersionHistory(workflowId: string) {
+    try {
+      const res = await fetch(`${API_BASE}/api/workflows/${workflowId}/versions`)
+      if (res.ok) {
+        const versions = await res.json()
+        setVersionHistory(versions)
+      }
+    } catch (e) {
+      console.error('Failed to load version history:', e)
+    }
+  }
+
+  // Restore to a specific version
+  async function restoreToVersion(workflowId: string, versionNumber: number) {
+    try {
+      const res = await fetch(`${API_BASE}/api/workflows/${workflowId}/restore/${versionNumber}`, {
+        method: 'POST'
+      })
+      if (res.ok) {
+        const result = await res.json()
+        // Reload the workflow to get the restored version
+        if (activeWorkflowId) {
+          await loadWorkflow(activeWorkflowId)
+        }
+        // Refresh library
+        fetch(`${API_BASE}/api/library`).then((r) => r.json()).then(setLibrary).catch(() => {})
+        
+        // Show success message
+        console.log(`Restored to version ${versionNumber}, created new version ${result.newVersionNumber}`)
+      } else {
+        throw new Error('Failed to restore version')
+      }
+    } catch (e: any) {
+      setError(e?.message || 'Failed to restore version')
+    }
+  }
+
+  async function deleteWorkflow(workflowId: string) {
+    if (!confirm('Are you sure you want to delete this workflow?')) return
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/workflows/${workflowId}`, { method: 'DELETE' })
+      if (!res.ok) throw new Error('Failed to delete workflow')
+      
+      // If this was the active workflow, clear it
+      if (activeWorkflowId === parseInt(workflowId.replace('workflow_', ''))) {
+        setActiveWorkflowId(null)
+        setModel(initialModel)
+        setHistory([initialModel])
+        setHistoryIndex(0)
+      }
+      
+      // Refresh the library
+      fetch(`${API_BASE}/api/library`).then((r) => r.json()).then(setLibrary).catch(() => {})
+    } catch (e: any) {
+      alert(`Failed to delete workflow: ${e.message}`)
+    }
+  }
+
+  async function startRenaming(workflowId: string, currentName: string) {
+    setEditingWorkflowId(parseInt(workflowId.replace('workflow_', '')))
+    setEditingName(currentName)
+  }
+
+  async function saveRename(workflowId: string) {
+    if (!editingName.trim()) return
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/workflows/${workflowId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editingName.trim() })
+      })
+      if (!res.ok) throw new Error('Failed to rename workflow')
+      
+      setEditingWorkflowId(null)
+      setEditingName('')
+      
+      // Refresh the library
+      fetch(`${API_BASE}/api/library`).then((r) => r.json()).then(setLibrary).catch(() => {})
+    } catch (e: any) {
+      alert(`Failed to rename workflow: ${e.message}`)
+    }
+  }
+
+  function cancelRename() {
+    setEditingWorkflowId(null)
+    setEditingName('')
   }
 
   async function sendInstruction(text: string) {
@@ -131,7 +306,10 @@ export const App: React.FC = () => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
       const parsed = ProcessSchema.parse(data)
-      setModel(parsed)
+      
+      // Update model with history tracking
+      updateModelWithHistory(parsed)
+      
       if (activeWorkflowId != null) scheduleSave(activeWorkflowId, parsed)
     } catch (e: any) {
       setError(e?.message || 'Unknown error')
@@ -165,28 +343,24 @@ export const App: React.FC = () => {
 
   // Always reserve a minimal left stripe for the hamburger icon
   const MIN_STRIPE = 48
-  const templateCols = !isMobile
-    ? (sidebarOpen
-        ? `${SIDEBAR_WIDTH}px 360px 1fr`
-        : `${MIN_STRIPE}px 360px 1fr`)
-    : '360px 1fr'
+  const templateCols = sidebarOpen
+    ? `${SIDEBAR_WIDTH}px 360px 1fr`
+    : `${MIN_STRIPE}px 360px 1fr`
 
   return (
     <div style={{ position: 'relative', display: 'grid', gridTemplateColumns: templateCols, height: '100vh', fontFamily: 'Inter, system-ui, sans-serif' }}>
-      {/* Minimal left stripe always present (desktop only) */}
-      {!isMobile && (
-        <div style={{ width: MIN_STRIPE, background: '#fff', borderRight: '1px solid #e5e7eb', position: 'relative', gridColumn: '1 / 2', zIndex: 1 }}>
-          <button
-            aria-label="Toggle process library"
-            onClick={toggleSidebar}
-            style={{ position: 'absolute', top: 8, left: 8, width: 34, height: 34, borderRadius: 8, border: '1px solid #e5e7eb', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 30 }}
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111827" strokeWidth="2" strokeLinecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
-          </button>
-        </div>
-      )}
-      {/* Sidebar when open (desktop only) */}
-      {!isMobile && sidebarOpen && (
+      {/* Minimal left stripe always present */}
+      <div style={{ width: MIN_STRIPE, background: '#fff', borderRight: '1px solid #e5e7eb', position: 'relative', gridColumn: '1 / 2', zIndex: 1 }}>
+        <button
+          aria-label="Toggle process library"
+          onClick={toggleSidebar}
+          style={{ position: 'absolute', top: 8, left: 8, width: 34, height: 34, borderRadius: 8, border: '1px solid #e5e7eb', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 30 }}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111827" strokeWidth="2" strokeLinecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        </button>
+      </div>
+      {/* Sidebar when open */}
+      {sidebarOpen && (
         <div style={{ borderRight: '1px solid #e5e7eb', padding: 12, overflowY: 'auto', width: SIDEBAR_WIDTH, position: 'relative', gridColumn: '1 / 2', zIndex: 2 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 8, gap: 12 }}>
               <strong style={{ flex: 1, textAlign: 'center', fontSize: 18 }}>Workflows</strong>
@@ -201,27 +375,126 @@ export const App: React.FC = () => {
                 if (res.ok) {
                   const created = await res.json()
                   setActiveWorkflowId(created.id)
-                  setModel(ProcessSchema.parse(created.jsonContent))
-                  // optimistic insert
-                  setLibrary((prev) => prev.map((d) => d.departmentId === dept.departmentId ? { ...d, workflows: [{ id: created.id, name: created.name, updatedAt: created.updatedAt }, ...d.workflows] } : d))
+                  
+                  const newModel = ProcessSchema.parse(created.jsonContent)
+                  // Reset history when creating a new workflow
+                  setHistory([newModel])
+                  setHistoryIndex(0)
+                  setModel(newModel)
+                  
+                  // Refresh the library to show new workflow
+                  fetch(`${API_BASE}/api/library`).then((r) => r.json()).then(setLibrary).catch(() => {})
                 }
               }}
-              style={{ fontSize: 12 }}
+              style={{ 
+                fontSize: 12, 
+                padding: '4px 12px', 
+                border: '1px solid #d1d5db', 
+                borderRadius: 4, 
+                cursor: 'pointer',
+                backgroundColor: 'white'
+              }}
             >New</button>
           </div>
           {library.map((dept) => (
             <div key={dept.departmentId} style={{ marginBottom: 8 }}>
               <div style={{ fontSize: 12, color: '#6b7280', margin: '8px 0' }}>{dept.departmentName}</div>
               {dept.workflows.map((wf) => {
-                const sel = activeWorkflowId === wf.id
+                const numericId = parseInt(wf.id.replace('workflow_', ''))
+                const sel = activeWorkflowId === numericId
+                const isEditing = editingWorkflowId === numericId
                 return (
                   <div
                     key={wf.id}
-                    onClick={() => loadWorkflow(wf.id)}
-                    style={{ cursor: 'pointer', padding: '6px 8px', borderRadius: 6, background: sel ? '#e0f2fe' : 'transparent' }}
+                    style={{ 
+                      padding: '6px 8px', 
+                      borderRadius: 6, 
+                      background: sel ? '#e0f2fe' : 'transparent',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8
+                    }}
                   >
-                    <div style={{ fontSize: 14 }}>{wf.name}</div>
-                    <div style={{ fontSize: 11, color: '#6b7280' }}>{new Date(wf.updatedAt).toLocaleString()}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      {isEditing ? (
+                        <input
+                          value={editingName}
+                          onChange={(e) => setEditingName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveRename(wf.id)
+                            if (e.key === 'Escape') cancelRename()
+                          }}
+                          onBlur={() => saveRename(wf.id)}
+                          autoFocus
+                          style={{ 
+                            width: '100%', 
+                            fontSize: 14, 
+                            border: '1px solid #d1d5db', 
+                            borderRadius: 4, 
+                            padding: '2px 4px' 
+                          }}
+                        />
+                      ) : (
+                        <div
+                          onClick={() => isEditing ? undefined : loadWorkflow(numericId)}
+                          onDoubleClick={() => startRenaming(wf.id, wf.name)}
+                          style={{ cursor: 'pointer' }}
+                        >
+                          <div style={{ fontSize: 14, fontWeight: sel ? 'bold' : 'normal' }}>{wf.name}</div>
+                          <div style={{ fontSize: 11, color: '#6b7280' }}>{new Date(wf.updatedAt).toLocaleString()}</div>
+                        </div>
+                      )}
+                    </div>
+                    {!isEditing && (
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            startRenaming(wf.id, wf.name)
+                          }}
+                          style={{
+                            padding: '4px',
+                            border: 'none',
+                            background: 'transparent',
+                            cursor: 'pointer',
+                            borderRadius: 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center'
+                          }}
+                          title="Rename"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                            <path d="m18.5 2.5-6 6L8 11l1 1 2.5-4.5L18.5 2.5z"></path>
+                          </svg>
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            deleteWorkflow(wf.id)
+                          }}
+                          style={{
+                            padding: '4px',
+                            border: 'none',
+                            background: 'transparent',
+                            cursor: 'pointer',
+                            borderRadius: 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center'
+                          }}
+                          title="Delete"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="3,6 5,6 21,6"></polyline>
+                            <path d="m19,6v14a2,2 0 0,1 -2,2H7a2,2 0 0,1 -2,-2V6m3,0V4a2,2 0 0,1 2,-2h4a2,2 0 0,1 2,2v2"></path>
+                            <line x1="10" y1="11" x2="10" y2="17"></line>
+                            <line x1="14" y1="11" x2="14" y2="17"></line>
+                          </svg>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )
               })}
@@ -230,9 +503,177 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      {/* Chat column (unchanged) */}
+      {/* Chat column with history controls */}
       <div style={{ borderRight: '1px solid #e5e7eb', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, overflow: 'hidden' }}>
-    <h2 style={{ margin: 0, textAlign: 'center', fontSize: 20 }}>Chat</h2>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <h2 style={{ margin: 0, fontSize: 20 }}>Chat</h2>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', backgroundColor: '#f9fafb', padding: '5px 8px', borderRadius: 6 }}>
+            <span style={{ fontSize: 13, marginRight: 4, fontWeight: 'bold' }}>History:</span>
+            <button 
+              onClick={goBackInHistory} 
+              disabled={historyIndex <= 0}
+              style={{ 
+                padding: '6px 10px',
+                border: '1px solid #d1d5db',
+                borderRadius: 4,
+                background: historyIndex <= 0 ? '#f3f4f6' : 'white',
+                cursor: historyIndex <= 0 ? 'not-allowed' : 'pointer',
+                opacity: historyIndex <= 0 ? 0.6 : 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
+              }}
+              title="Undo (Ctrl+Z)"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 10h10a5 5 0 0 1 5 5v2a5 5 0 0 1-5 5h-4"></path>
+                <path d="M7 15l-4-4 4-4"></path>
+              </svg>
+              <span style={{ marginLeft: 4, fontSize: 13 }}>Undo</span>
+            </button>
+            <button 
+              onClick={goForwardInHistory} 
+              disabled={historyIndex >= history.length - 1}
+              style={{ 
+                padding: '6px 10px',
+                border: '1px solid #d1d5db',
+                borderRadius: 4,
+                background: historyIndex >= history.length - 1 ? '#f3f4f6' : 'white',
+                cursor: historyIndex >= history.length - 1 ? 'not-allowed' : 'pointer',
+                opacity: historyIndex >= history.length - 1 ? 0.6 : 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
+              }}
+              title="Redo (Ctrl+Y)"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 10H11a5 5 0 0 0-5 5v2a5 5 0 0 0 5 5h4"></path>
+                <path d="M17 15l4-4-4-4"></path>
+              </svg>
+              <span style={{ marginLeft: 4, fontSize: 13 }}>Redo</span>
+            </button>
+            <span style={{ fontSize: 12, color: '#6b7280', marginLeft: 4, fontWeight: 'bold' }}>
+              {historyIndex + 1}/{history.length}
+            </span>
+            
+            {/* Version History Button */}
+            <button
+              onClick={() => {
+                if (activeWorkflowId && typeof activeWorkflowId === 'string') {
+                  loadVersionHistory(activeWorkflowId)
+                }
+                setShowVersionHistory(!showVersionHistory)
+              }}
+              disabled={!activeWorkflowId}
+              style={{
+                padding: '6px 10px',
+                marginLeft: 8,
+                border: '1px solid #d1d5db',
+                borderRadius: 4,
+                background: !activeWorkflowId ? '#f3f4f6' : 'white',
+                cursor: !activeWorkflowId ? 'not-allowed' : 'pointer',
+                opacity: !activeWorkflowId ? 0.6 : 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
+              }}
+              title="Version History"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12,6 12,12 16,14"></polyline>
+              </svg>
+              <span style={{ marginLeft: 4, fontSize: 12 }}>History</span>
+            </button>
+          </div>
+          
+          {/* Version History Panel */}
+          {showVersionHistory && activeWorkflowId && (
+            <div style={{
+              position: 'absolute',
+              top: 70,
+              right: 10,
+              width: 320,
+              maxHeight: 400,
+              background: 'white',
+              border: '1px solid #d1d5db',
+              borderRadius: 8,
+              boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+              zIndex: 1000,
+              overflow: 'hidden'
+            }}>
+              <div style={{
+                padding: '12px 16px',
+                borderBottom: '1px solid #e5e7eb',
+                background: '#f9fafb',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center'
+              }}>
+                <h3 style={{ margin: 0, fontSize: 14, fontWeight: 'bold' }}>Version History</h3>
+                <button
+                  onClick={() => setShowVersionHistory(false)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    padding: 4,
+                    borderRadius: 4
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+              <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+                {versionHistory.length === 0 ? (
+                  <div style={{ padding: 16, textAlign: 'center', color: '#6b7280', fontSize: 13 }}>
+                    No version history available
+                  </div>
+                ) : (
+                  versionHistory.map((version, index) => (
+                    <div
+                      key={version.id}
+                      style={{
+                        padding: '12px 16px',
+                        borderBottom: index < versionHistory.length - 1 ? '1px solid #f3f4f6' : 'none',
+                        cursor: 'pointer'
+                      }}
+                      onMouseEnter={(e) => (e.target as HTMLElement).style.background = '#f9fafb'}
+                      onMouseLeave={(e) => (e.target as HTMLElement).style.background = 'white'}
+                      onClick={() => {
+                        if (activeWorkflowId && typeof activeWorkflowId === 'string') {
+                          restoreToVersion(activeWorkflowId, version.versionNumber)
+                          setShowVersionHistory(false)
+                        }
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                        <span style={{ fontSize: 13, fontWeight: 'bold' }}>Version {version.versionNumber}</span>
+                        <span style={{ fontSize: 11, color: '#6b7280' }}>
+                          {new Date(version.createdAt).toLocaleDateString()}
+                        </span>
+                      </div>
+                      {version.changeNote && (
+                        <div style={{ fontSize: 12, color: '#374151', marginBottom: 4 }}>
+                          {version.changeNote}
+                        </div>
+                      )}
+                      {version.createdBy && (
+                        <div style={{ fontSize: 11, color: '#6b7280' }}>
+                          by {version.createdBy.name}
+                        </div>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </div>
         <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8, paddingRight: 4 }}>
           {messages.length === 0 && (
             <div style={{ fontSize: 12, color: '#6b7280' }}>Your messages will appear here.</div>
@@ -256,70 +697,24 @@ export const App: React.FC = () => {
           </button>
         </div>
         {error && <div style={{ color: 'crimson' }}>{error}</div>}
-        <div style={{ fontSize: 12, color: '#6b7280' }}>
-          Model is authoritative; server validates and returns updated JSON. {saving === 'saving' ? 'Saving…' : saving === 'saved' ? 'Saved' : saving === 'error' ? 'Save failed' : ''}
+        <div style={{ fontSize: 12, color: '#6b7280', display: 'flex', justifyContent: 'space-between' }}>
+          <span>
+            Model is authoritative; server validates and returns updated JSON. {saving === 'saving' ? 'Saving…' : saving === 'saved' ? 'Saved' : saving === 'error' ? 'Save failed' : ''}
+          </span>
+          {historyAction !== 'none' && (
+            <span style={{ 
+              fontWeight: 'bold', 
+              color: historyAction === 'undo' ? '#3b82f6' : '#10b981',
+              animation: 'fadeIn 0.3s ease-in-out'
+            }}>
+              {historyAction === 'undo' ? '⟲ Undone' : '⟳ Redone'}
+            </span>
+          )}
         </div>
       </div>
       <div style={{ position: 'relative' }}>
         <Canvas model={model} />
       </div>
-
-      {/* Mobile overlay sidebar */}
-      {isMobile && (
-        <>
-          {/* Backdrop */}
-          {sidebarOpen && (
-            <div onClick={() => setSidebarOpen(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.2)', zIndex: 20 }} />
-          )}
-          {/* Panel */}
-          <div
-            style={{
-              position: 'fixed', left: 0, top: 0, bottom: 0, width: SIDEBAR_WIDTH,
-              background: '#fff', borderRight: '1px solid #e5e7eb', padding: 12, overflowY: 'auto', zIndex: 25,
-              transform: `translateX(${sidebarOpen ? '0' : '-100%'})`, transition: 'transform 200ms ease-in-out'
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-              <strong>Workflows</strong>
-              <button
-                onClick={async () => {
-                  const dept = library[0]
-                  if (!dept) return
-                  const res = await fetch(`${API_BASE}/api/workflows`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: 'New Workflow', departmentId: dept.departmentId, json: initialModel })
-                  })
-                  if (res.ok) {
-                    const created = await res.json()
-                    setActiveWorkflowId(created.id)
-                    setModel(ProcessSchema.parse(created.jsonContent))
-                    setLibrary((prev) => prev.map((d) => d.departmentId === dept.departmentId ? { ...d, workflows: [{ id: created.id, name: created.name, updatedAt: created.updatedAt }, ...d.workflows] } : d))
-                  }
-                }}
-                style={{ fontSize: 12 }}
-              >New</button>
-            </div>
-            {library.map((dept) => (
-              <div key={dept.departmentId} style={{ marginBottom: 8 }}>
-                <div style={{ fontSize: 12, color: '#6b7280', margin: '8px 0' }}>{dept.departmentName}</div>
-                {dept.workflows.map((wf) => {
-                  const sel = activeWorkflowId === wf.id
-                  return (
-                    <div
-                      key={wf.id}
-                      onClick={() => { loadWorkflow(wf.id); setSidebarOpen(false) }}
-                      style={{ cursor: 'pointer', padding: '6px 8px', borderRadius: 6, background: sel ? '#e0f2fe' : 'transparent' }}
-                    >
-                      <div style={{ fontSize: 14 }}>{wf.name}</div>
-                      <div style={{ fontSize: 11, color: '#6b7280' }}>{new Date(wf.updatedAt).toLocaleString()}</div>
-                    </div>
-                  )
-                })}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
 
       {/* Save error toast */}
       {saving === 'error' && (
